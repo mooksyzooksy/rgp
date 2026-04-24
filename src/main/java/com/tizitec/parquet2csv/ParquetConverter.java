@@ -1,12 +1,18 @@
 package com.tizitec.parquet2csv;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.avro.Schema;
-import org.apache.avro.generic.GenericRecord;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVPrinter;
-import org.apache.parquet.avro.AvroParquetReader;
-import org.apache.parquet.hadoop.ParquetReader;
+import org.apache.parquet.column.page.PageReadStore;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.simple.convert.GroupRecordConverter;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.apache.parquet.io.ColumnIOFactory;
+import org.apache.parquet.io.MessageColumnIO;
+import org.apache.parquet.io.RecordReader;
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.Type;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -22,23 +28,27 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Core conversion logic. Reads any Parquet file using the Avro generic reader
- * (schema-driven, no POJOs required) and writes a CSV file.
+ * Core conversion logic. Reads any Parquet file using the low-level
+ * {@link ParquetFileReader} API with a {@link GroupRecordConverter} —
+ * fully generic, schema-driven, and free of Hadoop/MapReduce dependencies.
  *
  * <p>Type handling strategy:
  * <ul>
- *   <li>Primitive types (string, int, long, float, double, boolean, bytes, enum) → toString()</li>
- *   <li>Logical types (date, time, timestamp, decimal, uuid) → toString() via Avro's conversion</li>
- *   <li>Complex types (record, array, map, union with nested record) → JSON string</li>
- *   <li>Null → configurable null placeholder (default: empty string)</li>
+ *   <li>Primitive types (string, int, long, float, double, boolean, binary) → toString()</li>
+ *   <li>Complex types (group/struct, list, map) → JSON string via Jackson, or skipped
+ *       if {@link ConversionConfig#skipComplex()} is {@code true}</li>
+ *   <li>Null / missing fields → configurable null placeholder (default: empty string)</li>
  * </ul>
+ *
+ * <p>Uses {@link LocalInputFile} for all file I/O — pure Java NIO,
+ * no {@code HADOOP_HOME}, no {@code winutils.exe} required on any platform.
  */
 public class ParquetConverter {
 
     private static final Logger log = LoggerFactory.getLogger(ParquetConverter.class);
 
     private final ConversionConfig config;
-    private final ObjectMapper objectMapper;
+    private final ObjectMapper     objectMapper;
 
     public ParquetConverter(ConversionConfig config) {
         this.config       = config;
@@ -57,7 +67,7 @@ public class ParquetConverter {
         Path    csvFile = resolveCsvOutputPath(parquetFile);
         String  name    = parquetFile.getFileName().toString();
 
-        // ── Pre-flight checks ─────────────────────────────────────────────────
+        // ── Pre-flight ────────────────────────────────────────────────────────
         if (Files.exists(csvFile) && !config.overwrite()) {
             throw new FileAlreadyExistsException(
                     csvFile.toString(), null,
@@ -65,62 +75,66 @@ public class ParquetConverter {
             );
         }
 
-        long inputBytes = Files.exists(parquetFile) ? Files.size(parquetFile) : -1;
+        long inputBytes = Files.size(parquetFile);
         log.info("┌─ Starting  : {}", name);
         log.info("│  Input     : {}", parquetFile.toAbsolutePath());
         log.info("│  Output    : {}", csvFile.toAbsolutePath());
         log.info("│  File size : {}", formatBytes(inputBytes));
 
-        // ── Open Parquet reader ───────────────────────────────────────────────
-        try (ParquetReader<GenericRecord> reader = AvroParquetReader
-                .<GenericRecord>builder(new LocalInputFile(parquetFile))
-                .build()) {
+        // ── Open via pure-Java LocalInputFile (no Hadoop filesystem) ──────────
+        try (ParquetFileReader fileReader = ParquetFileReader.open(new LocalInputFile(parquetFile))) {
 
-            // Read the first record to bootstrap the schema
-            GenericRecord first = reader.read();
+            ParquetMetadata metadata   = fileReader.getFooter();
+            MessageType     schema     = metadata.getFileMetaData().getSchema();
+            List<String>    headers    = extractHeaders(schema);
+            int             cols       = headers.size();
+            long            totalRows  = fileReader.getRecordCount();
 
-            if (first == null) {
+            if (totalRows == 0) {
                 log.warn("│  ⚠ File is empty — writing header-only CSV.");
-                Files.createFile(csvFile);
+                writeHeaderOnlyCsv(csvFile, headers);
                 Duration elapsed = Duration.between(start, Instant.now());
-                log.info("└─ Done ({}) — 0 rows written.", ProgressLogger.formatDuration(elapsed));
-                return new ConversionResult(csvFile, 0, 0, elapsed);
+                log.info("└─ Done ({}) — 0 rows.", ProgressLogger.formatDuration(elapsed));
+                return new ConversionResult(csvFile, 0, cols, elapsed);
             }
 
-            Schema       schema  = first.getSchema();
-            List<String> headers = extractHeaders(schema);
-            int          cols    = headers.size();
-
             log.info("│  Columns   : {} → {}", cols, headers);
+            log.info("│  Rows      : {}", ProgressLogger.formatCount(totalRows));
             log.info("│  Progress  : every {:,} rows", config.progressInterval());
 
             CSVFormat      csvFormat = buildCsvFormat(headers);
             ProgressLogger progress  = new ProgressLogger(name, config.progressInterval());
 
-            // ── Write CSV ─────────────────────────────────────────────────────
+            // ── Iterate row groups → pages → records ──────────────────────────
             try (BufferedWriter writer = Files.newBufferedWriter(csvFile, StandardCharsets.UTF_8);
                  CSVPrinter printer = new CSVPrinter(writer, csvFormat)) {
 
-                // Write the first record (already read to extract schema)
-                printer.printRecord(toStringValues(first, schema));
-                progress.tick();
+                ColumnIOFactory  ioFactory = new ColumnIOFactory();
+                PageReadStore    pages;
 
-                GenericRecord record;
-                while ((record = reader.read()) != null) {
-                    printer.printRecord(toStringValues(record, schema));
-                    progress.tick();
+                while ((pages = fileReader.readNextRowGroup()) != null) {
+                    long         rowsInGroup = pages.getRowCount();
+                    MessageColumnIO columnIO = ioFactory.getColumnIO(schema);
+                    RecordReader<Group> recordReader = columnIO.getRecordReader(
+                            pages, new GroupRecordConverter(schema)
+                    );
+
+                    for (long i = 0; i < rowsInGroup; i++) {
+                        Group record = recordReader.read();
+                        printer.printRecord(toStringValues(record, schema));
+                        progress.tick();
+                    }
                 }
             }
 
-            // ── Final summary ─────────────────────────────────────────────────
+            // ── Summary ───────────────────────────────────────────────────────
             progress.done();
 
             Duration elapsed     = Duration.between(start, Instant.now());
-            long     outputBytes = Files.exists(csvFile) ? Files.size(csvFile) : -1;
+            long     outputBytes = Files.size(csvFile);
 
             log.info("│  CSV size  : {}", formatBytes(outputBytes));
-            log.info("└─ Completed : {} in {}",
-                    name, ProgressLogger.formatDuration(elapsed));
+            log.info("└─ Completed : {} in {}", name, ProgressLogger.formatDuration(elapsed));
 
             return new ConversionResult(csvFile, progress.rowCount(), cols, elapsed);
         }
@@ -140,155 +154,142 @@ public class ParquetConverter {
 
     // ─── Schema extraction ────────────────────────────────────────────────────
 
-    private List<String> extractHeaders(Schema schema) {
-        return schema.getFields()
-                .stream()
-                .filter(f -> !shouldSkip(f.schema()))
-                .map(Schema.Field::name)
+    /**
+     * Extracts the ordered list of column names from the Parquet schema.
+     * Complex fields are included unless {@link ConversionConfig#skipComplex()} is set.
+     *
+     * @param schema the Parquet message schema read from the file footer
+     * @return ordered list of column names for the CSV header
+     */
+    private List<String> extractHeaders(MessageType schema) {
+        return schema.getFields().stream()
+                .filter(f -> !shouldSkip(f))
+                .map(Type::getName)
                 .toList();
     }
 
     /**
-     * Returns true if the field should be excluded because it is a complex type
-     * (RECORD, ARRAY, MAP) and --skip-complex is enabled.
-     * Nullable unions wrapping a complex type are also caught here.
+     * Returns true if the field should be excluded because it is a complex/group type
+     * and {@link ConversionConfig#skipComplex()} is enabled.
+     *
+     * @param field the Parquet schema field to check
+     * @return true if the field should be omitted from output
      */
-    private boolean shouldSkip(Schema fieldSchema) {
-        if (!config.skipComplex()) return false;
-        Schema resolved = resolveSchema(fieldSchema);
-        return switch (resolved.getType()) {
-            case RECORD, ARRAY, MAP -> true;
-            default                 -> false;
-        };
+    private boolean shouldSkip(Type field) {
+        return config.skipComplex() && !field.isPrimitive();
     }
 
     // ─── Record serialization ─────────────────────────────────────────────────
 
-    private List<Object> toStringValues(GenericRecord record, Schema schema) {
-        List<Object> values = new ArrayList<>(schema.getFields().size());
-        for (Schema.Field field : schema.getFields()) {
-            if (shouldSkip(field.schema())) continue;
-            Object raw = record.get(field.name());
-            values.add(serializeField(raw, field.schema()));
+    /**
+     * Converts a Parquet {@link Group} (one row) into an ordered list of String values,
+     * one per included column, in schema field order.
+     *
+     * @param group  the row record read from the Parquet file
+     * @param schema the message schema defining field order and types
+     * @return ordered list of serialized field values
+     */
+    private List<Object> toStringValues(Group group, MessageType schema) {
+        List<Object> values = new ArrayList<>(schema.getFieldCount());
+
+        for (Type field : schema.getFields()) {
+            if (shouldSkip(field)) continue;
+
+            String fieldName = field.getName();
+            int    fieldIdx  = schema.getFieldIndex(fieldName);
+
+            // Check if the field has any value in this row (handles nulls/optional fields)
+            int repetitionCount = group.getFieldRepetitionCount(fieldIdx);
+
+            if (repetitionCount == 0) {
+                values.add(config.nullValue());
+                continue;
+            }
+
+            values.add(serializeField(group, field, fieldIdx));
         }
         return values;
     }
 
     /**
-     * Serializes a single Parquet field value to a {@code String} suitable for CSV output.
+     * Serializes a single field value from a {@link Group} row to a String.
      *
-     * <p>Dispatch order:
-     * <ol>
-     *   <li>If value is {@code null} → returns the configured null placeholder.</li>
-     *   <li>Resolves nullable unions to their non-null branch.</li>
-     *   <li>RECORD / ARRAY / MAP → JSON string via Jackson (or skipped if
-     *       {@link ConversionConfig#skipComplex()} is {@code true}, but note: skipping
-     *       is handled upstream in {@link #toStringValues}; this method is not called
-     *       for skipped fields).</li>
-     *   <li>All other types → {@code Object.toString()}.</li>
-     * </ol>
+     * <p>Primitive types are read with the appropriate typed accessor for accuracy.
+     * Complex (group) types are serialized as a JSON string via Jackson.
      *
-     * @param value       the raw field value from the Avro {@code GenericRecord}
-     * @param fieldSchema the Avro schema of the field, used to determine serialization strategy
-     * @return a non-null string representation of the value
+     * @param group    the row containing the field
+     * @param field    the schema definition of the field
+     * @param fieldIdx the integer index of the field within the schema
+     * @return a non-null string representation, or the configured null placeholder
      */
-    private String serializeField(Object value, Schema fieldSchema) {
-        if (value == null) {
+    private String serializeField(Group group, Type field, int fieldIdx) {
+        try {
+            if (field.isPrimitive()) {
+                return serializePrimitive(group, field, fieldIdx);
+            } else {
+                // Complex group type — serialize as JSON
+                Group nested = group.getGroup(fieldIdx, 0);
+                return toJson(nested.toString());
+            }
+        } catch (Exception e) {
+            log.warn("│  ⚠ Could not read field '{}': {} — using null value",
+                    field.getName(), e.getMessage());
             return config.nullValue();
         }
+    }
 
-        Schema resolved = resolveSchema(fieldSchema);
+    /**
+     * Reads a primitive Parquet field using the appropriate typed accessor.
+     * Falls back to the generic {@code group.getValueToString()} if the
+     * primitive type is not explicitly handled.
+     *
+     * @param group    the row containing the field
+     * @param field    the schema field (must be primitive)
+     * @param fieldIdx the integer index of the field within the schema
+     * @return string representation of the primitive value
+     */
+    private String serializePrimitive(Group group, Type field, int fieldIdx) {
+        org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName typeName =
+                field.asPrimitiveType().getPrimitiveTypeName();
 
-        return switch (resolved.getType()) {
-            case NULL   -> config.nullValue();
-            case RECORD -> toJson(value);
-            case ARRAY  -> toJson(value);
-            case MAP    -> toJson(value);
-            case UNION  -> {
-                Schema runtimeSchema = resolveUnionType(value, resolved);
-                yield serializeField(value, runtimeSchema);
-            }
-            // STRING, INT, LONG, FLOAT, DOUBLE, BOOLEAN, ENUM, BYTES, FIXED
-            default -> value.toString();
+        return switch (typeName) {
+            case INT32   -> String.valueOf(group.getInteger(fieldIdx, 0));
+            case INT64   -> String.valueOf(group.getLong(fieldIdx, 0));
+            case FLOAT   -> String.valueOf(group.getFloat(fieldIdx, 0));
+            case DOUBLE  -> String.valueOf(group.getDouble(fieldIdx, 0));
+            case BOOLEAN -> String.valueOf(group.getBoolean(fieldIdx, 0));
+            case BINARY, FIXED_LEN_BYTE_ARRAY ->
+                    group.getString(fieldIdx, 0); // covers STRING, ENUM, DECIMAL-as-bytes
+            case INT96   ->
+                    group.getInt96(fieldIdx, 0).toHexString(); // legacy timestamp
         };
-    }
-
-    /**
-     * Unwraps a nullable union schema to its non-null branch.
-     *
-     * <p>Parquet nullable fields are represented in Avro as a two-branch union
-     * {@code ["null", "ActualType"]}. This method detects that pattern and returns
-     * the non-null branch directly, allowing callers to dispatch on the real type.
-     * For non-union schemas or complex multi-branch unions, the schema is returned as-is.
-     *
-     * @param schema the field schema, potentially a union
-     * @return the resolved non-null schema, or the original schema if resolution is not applicable
-     */
-    private Schema resolveSchema(Schema schema) {
-        if (schema.getType() != Schema.Type.UNION) {
-            return schema;
-        }
-        List<Schema> types = schema.getTypes();
-        if (types.size() == 2) {
-            return types.stream()
-                    .filter(s -> s.getType() != Schema.Type.NULL)
-                    .findFirst()
-                    .orElse(schema);
-        }
-        return schema;
-    }
-
-    /**
-     * Determines the correct Avro branch schema for a value inside a complex multi-branch union.
-     *
-     * <p>Used as a fallback when {@link #resolveSchema} cannot simplify the union (i.e. more
-     * than two branches). Matches the runtime Java type of {@code value} against known Avro
-     * type mappings: {@code GenericRecord} → RECORD, {@code List} → ARRAY,
-     * {@code Map} → MAP, {@code null} → NULL. Falls back to {@code STRING} if no branch matches.
-     *
-     * @param value       the runtime value whose type must be matched
-     * @param unionSchema the multi-branch union schema to resolve against
-     * @return the matching branch schema, or a synthetic STRING schema as a last resort
-     */
-    private Schema resolveUnionType(Object value, Schema unionSchema) {
-        for (Schema branch : unionSchema.getTypes()) {
-            if (branch.getType() == Schema.Type.NULL   && value == null)                       return branch;
-            if (value instanceof GenericRecord         && branch.getType() == Schema.Type.RECORD) return branch;
-            if (value instanceof List<?>               && branch.getType() == Schema.Type.ARRAY)  return branch;
-            if (value instanceof java.util.Map<?, ?>  && branch.getType() == Schema.Type.MAP)    return branch;
-        }
-        return Schema.create(Schema.Type.STRING);
     }
 
     // ─── JSON serialization ───────────────────────────────────────────────────
 
     /**
-     * Serializes a complex Avro value (GenericRecord, GenericArray, or Map) to a JSON string
-     * using Jackson's {@code ObjectMapper}.
+     * Wraps a complex field's string representation in a JSON string.
+     * Parquet's {@code Group.toString()} produces a structured text format;
+     * we wrap it as a JSON string value for CSV compatibility.
      *
-     * <p>Avro's collection types are Jackson-serializable out of the box. Falls back to
-     * {@code Object.toString()} if Jackson throws, logging a warning.
-     *
-     * @param value the complex field value to serialize
-     * @return a JSON string representation, never {@code null}
+     * @param value the string representation of the complex value
+     * @return a JSON-encoded string, never {@code null}
      */
-    private String toJson(Object value) {
+    private String toJson(String value) {
         try {
             return objectMapper.writeValueAsString(value);
         } catch (Exception e) {
-            log.warn("│  ⚠ Could not serialize field to JSON, falling back to toString(): {}", e.getMessage());
-            return value.toString();
+            log.warn("│  ⚠ JSON serialization failed, using raw value: {}", e.getMessage());
+            return value;
         }
     }
 
-    // ─── CSV formatting ───────────────────────────────────────────────────────
+    // ─── CSV helpers ──────────────────────────────────────────────────────────
 
     /**
-     * Builds the Apache Commons CSV format used for writing.
-     * Header, delimiter, record separator, and null string are all driven by
-     * {@link ConversionConfig}.
+     * Builds the Apache Commons CSV format driven by {@link ConversionConfig}.
      *
-     * @param headers ordered list of column names derived from the Parquet schema
+     * @param headers ordered column names for the CSV header row
      * @return configured {@code CSVFormat} instance
      */
     private CSVFormat buildCsvFormat(List<String> headers) {
@@ -300,15 +301,28 @@ public class ParquetConverter {
                 .build();
     }
 
+    /**
+     * Writes a header-only CSV file for an empty Parquet input.
+     *
+     * @param csvFile the target CSV path
+     * @param headers the column names to write as the header row
+     * @throws IOException if the file cannot be written
+     */
+    private void writeHeaderOnlyCsv(Path csvFile, List<String> headers) throws IOException {
+        try (BufferedWriter writer = Files.newBufferedWriter(csvFile, StandardCharsets.UTF_8);
+             CSVPrinter printer = new CSVPrinter(writer, buildCsvFormat(headers))) {
+            // header is written automatically by CSVFormat; no rows to add
+        }
+    }
+
     // ─── Path helpers ─────────────────────────────────────────────────────────
 
     /**
-     * Derives the output CSV {@link Path} for a given Parquet input file.
-     * The base name is preserved and the {@code .parquet} extension is replaced with {@code .csv}.
-     * The resulting path is placed directly inside the configured output directory.
+     * Derives the output CSV path: same base name as the input, {@code .parquet} → {@code .csv},
+     * placed in the configured output directory.
      *
      * @param parquetFile the source Parquet file
-     * @return the target CSV file path (not yet created)
+     * @return the target CSV path (not yet created)
      */
     private Path resolveCsvOutputPath(Path parquetFile) {
         String originalName = parquetFile.getFileName().toString();
@@ -320,10 +334,6 @@ public class ParquetConverter {
 
     /**
      * Formats a byte count as a human-readable string with an appropriate unit suffix.
-     * Uses binary units (1 KB = 1,024 bytes).
-     *
-     * <p>Examples: {@code 512} → {@code "512 B"}, {@code 1536} → {@code "1.5 KB"},
-     * {@code 10485760} → {@code "10.0 MB"}.
      *
      * @param bytes the byte count; negative values return {@code "unknown"}
      * @return a formatted string such as {@code "142.3 MB"}
@@ -335,5 +345,4 @@ public class ParquetConverter {
         if (bytes < 1_073_741_824) return String.format("%.1f MB", bytes / 1_048_576.0);
         return                            String.format("%.2f GB", bytes / 1_073_741_824.0);
     }
-
 }
