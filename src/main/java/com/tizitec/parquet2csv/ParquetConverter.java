@@ -5,10 +5,8 @@ import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVPrinter;
-import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.avro.AvroParquetReader;
 import org.apache.parquet.hadoop.ParquetReader;
-import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -41,12 +39,10 @@ public class ParquetConverter {
 
     private final ConversionConfig config;
     private final ObjectMapper objectMapper;
-    private final Configuration hadoopConfig;
 
     public ParquetConverter(ConversionConfig config) {
         this.config       = config;
         this.objectMapper = new ObjectMapper();
-        this.hadoopConfig = buildMinimalHadoopConfig();
     }
 
     /**
@@ -76,11 +72,8 @@ public class ParquetConverter {
         log.info("│  File size : {}", formatBytes(inputBytes));
 
         // ── Open Parquet reader ───────────────────────────────────────────────
-        org.apache.hadoop.fs.Path hadoopPath = toHadoopPath(parquetFile);
-
         try (ParquetReader<GenericRecord> reader = AvroParquetReader
-                .<GenericRecord>builder(HadoopInputFile.fromPath(hadoopPath, hadoopConfig))
-                .withConf(hadoopConfig)
+                .<GenericRecord>builder(new LocalInputFile(parquetFile))
                 .build()) {
 
             // Read the first record to bootstrap the schema
@@ -323,17 +316,6 @@ public class ParquetConverter {
         return config.outputDir().resolve(csvName);
     }
 
-    /**
-     * Converts a Java NIO {@link Path} to a Hadoop {@code Path} via its URI,
-     * ensuring the Hadoop filesystem abstraction can locate the local file.
-     *
-     * @param path the NIO path to convert
-     * @return equivalent Hadoop path
-     */
-    private org.apache.hadoop.fs.Path toHadoopPath(Path path) {
-        return new org.apache.hadoop.fs.Path(path.toAbsolutePath().toUri());
-    }
-
     // ─── Formatting helpers ───────────────────────────────────────────────────
 
     /**
@@ -354,24 +336,4 @@ public class ParquetConverter {
         return                            String.format("%.2f GB", bytes / 1_073_741_824.0);
     }
 
-    // ─── Hadoop configuration ─────────────────────────────────────────────────
-
-    /**
-     * Builds a minimal Hadoop {@link Configuration} scoped to local filesystem access only.
-     *
-     * <p>Passing {@code false} to the {@code Configuration} constructor prevents loading
-     * of any default XML files ({@code core-default.xml}, {@code core-site.xml}), which
-     * avoids spurious warnings about missing HDFS, YARN, or native library resources.
-     * Only the settings required to read local files via {@code file:///} are set.
-     *
-     * @return a lightweight Hadoop configuration for local file I/O
-     */
-    private Configuration buildMinimalHadoopConfig() {
-        Configuration conf = new Configuration(false); // false = no default XML loading
-        conf.set("fs.defaultFS",               "file:///");
-        conf.set("fs.file.impl",               org.apache.hadoop.fs.LocalFileSystem.class.getName());
-        conf.set("fs.file.impl.disable.cache", "true");
-        conf.set("io.native.lib.available",    "false");
-        return conf;
-    }
 }
