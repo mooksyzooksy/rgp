@@ -1,6 +1,5 @@
 package com.tizitec.parquet2csv;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVPrinter;
 import org.apache.parquet.column.page.PageReadStore;
@@ -48,11 +47,9 @@ public class ParquetConverter {
     private static final Logger log = LoggerFactory.getLogger(ParquetConverter.class);
 
     private final ConversionConfig config;
-    private final ObjectMapper     objectMapper;
 
     public ParquetConverter(ConversionConfig config) {
-        this.config       = config;
-        this.objectMapper = new ObjectMapper();
+        this.config = config;
     }
 
     /**
@@ -227,7 +224,7 @@ public class ParquetConverter {
             if (field.isPrimitive()) {
                 return serializePrimitive(group, field, fieldIdx);
             } else {
-                // Complex group type — serialize as JSON
+                // Complex group type — use Parquet's own toString() representation
                 Group nested = group.getGroup(fieldIdx, 0);
                 return toJson(nested.toString());
             }
@@ -273,20 +270,16 @@ public class ParquetConverter {
     // ─── JSON serialization ───────────────────────────────────────────────────
 
     /**
-     * Wraps a complex field's string representation in a JSON string.
-     * Parquet's {@code Group.toString()} produces a structured text format;
-     * we wrap it as a JSON string value for CSV compatibility.
+     * Serializes a complex Parquet Group field to a string for CSV output.
+     * Uses Parquet's own {@code Group.toString()} which produces a structured
+     * text representation — no external JSON library needed.
      *
-     * @param value the string representation of the complex value
-     * @return a JSON-encoded string, never {@code null}
+     * @param value the string representation of the complex Group value
+     * @return the value wrapped in quotes for CSV safety, never {@code null}
      */
     private String toJson(String value) {
-        try {
-            return objectMapper.writeValueAsString(value);
-        } catch (Exception e) {
-            log.warn("│  ⚠ JSON serialization failed, using raw value: {}", e.getMessage());
-            return value;
-        }
+        // Escape any double-quotes inside the value so CSV stays valid
+        return value.replace(""", """");
     }
 
     // ─── CSV helpers ──────────────────────────────────────────────────────────
