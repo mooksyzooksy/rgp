@@ -252,16 +252,21 @@ public class ParquetConverter {
         org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName typeName =
                 field.asPrimitiveType().getPrimitiveTypeName();
 
+        // getValueToString() is the universal safe accessor on Group —
+        // it handles all primitive types including INT96 and BINARY correctly.
+        // For well-known types we use typed accessors for cleaner output.
         return switch (typeName) {
             case INT32   -> String.valueOf(group.getInteger(fieldIdx, 0));
             case INT64   -> String.valueOf(group.getLong(fieldIdx, 0));
             case FLOAT   -> String.valueOf(group.getFloat(fieldIdx, 0));
             case DOUBLE  -> String.valueOf(group.getDouble(fieldIdx, 0));
             case BOOLEAN -> String.valueOf(group.getBoolean(fieldIdx, 0));
-            case BINARY, FIXED_LEN_BYTE_ARRAY ->
-                    group.getString(fieldIdx, 0); // covers STRING, ENUM, DECIMAL-as-bytes
-            case INT96   ->
-                    group.getInt96(fieldIdx, 0).toHexString(); // legacy timestamp
+            // BINARY covers UTF8 strings, ENUMs, DECIMAL-as-bytes, JSON, BSON
+            // FIXED_LEN_BYTE_ARRAY covers fixed decimals, UUIDs
+            // INT96 is a legacy 12-byte timestamp (Spark/Hive era)
+            // All three: getValueToString() handles them safely without deprecated APIs
+            case BINARY, FIXED_LEN_BYTE_ARRAY, INT96 ->
+                    group.getValueToString(fieldIdx, 0);
         };
     }
 
