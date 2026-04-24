@@ -187,7 +187,24 @@
                                         <exclude>META-INF/NOTICE*</exclude>
                                     </excludes>
                                 </filter>
+                                <!-- Parquet ships its own shaded Jackson under shaded/parquet/...
+                                     We must NOT relocate or filter it — keep it intact so that
+                                     ParquetMetadataConverter can find its own Jackson at runtime -->
+                                <filter>
+                                    <artifact>org.apache.parquet:parquet-hadoop</artifact>
+                                    <includes>
+                                        <include>**</include>
+                                    </includes>
+                                </filter>
                             </filters>
+                            <relocations>
+                                <!-- Relocate OUR Jackson away from Parquet's shaded copy
+                                     to avoid class conflicts at runtime in the fat JAR -->
+                                <relocation>
+                                    <pattern>com.fasterxml.jackson</pattern>
+                                    <shadedPattern>com.tizitec.shaded.jackson</shadedPattern>
+                                </relocation>
+                            </relocations>
                             <transformers>
                                 <!-- Main class -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
